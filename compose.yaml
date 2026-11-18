@@ -1,0 +1,18 @@
+services:
+  hookrelay:
+    build: .
+    container_name: hookrelay
+    ports:
+      - "127.0.0.1:8093:8093"
+    environment:
+      HOOKRELAY_HOST: "0.0.0.0"
+      HOOKRELAY_PORT: "8093"
+      HOOKRELAY_DATA_DIR: "/data"
+      HOOKRELAY_ADMIN_TOKEN: "${HOOKRELAY_ADMIN_TOKEN:-change-me-admin-token}"
+      HOOKRELAY_ALLOW_PRIVATE_TARGETS: "${HOOKRELAY_ALLOW_PRIVATE_TARGETS:-false}"
+    volumes:
+      - hookrelay_data:/data
+    restart: unless-stopped
+
+volumes:
+  hookrelay_data:

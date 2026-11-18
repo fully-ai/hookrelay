@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HookRelay — Webhook Delivery Console</title>
+  <style>
+    body { margin:0; font-family:system-ui, sans-serif; background:#0d1117; color:#e6edf3; padding:20px; max-width:1160px; margin-inline:auto; }
+    .card { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:14px; margin-bottom:14px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:10px; margin-bottom:14px; }
+    input, button { padding:7px 10px; border-radius:6px; border:1px solid #30363d; background:#21262d; color:#e6edf3; }
+    button { background:#2f81f7; border:none; cursor:pointer; font-weight:600; }
+    button.ghost { background:#21262d; border:1px solid #30363d; }
+    button.sm { padding:4px 8px; font-size:0.78rem; }
+    table { width:100%; border-collapse:collapse; font-size:0.86rem; }
+    th, td { text-align:left; padding:7px 8px; border-bottom:1px solid #30363d; }
+    .pill { padding:2px 7px; border-radius:999px; font-size:0.74rem; font-weight:700; background:#30363d; }
+    .st-delivered, .st-healthy { background:#14532d; color:#bbf7d0; }
+    .st-dlq, .st-circuit_open { background:#7f1d1d; color:#fecaca; }
+    .st-pending, .st-degraded { background:#713f12; color:#fef08a; }
+  </style>
+</head>
+<body>
+  <h1>HookRelay</h1>
+  <div class="card">
+    <div class="row">
+      <input id="admin-tok" type="password" placeholder="Admin Token (to bootstrap tenant)" />
+      <input id="tenant-name" placeholder="New Tenant Name" />
+      <button class="ghost" onclick="createTenant()">Create Tenant</button>
+      <input id="api-key" type="password" placeholder="Tenant Bearer API Key (hr_live_...)" style="flex:1;" />
+      <button onclick="refresh()">Connect / Refresh</button>
+    </div>
+    <div id="status-msg" style="margin-top:6px;font-size:0.84rem;color:#8b949e;"></div>
+  </div>
+
+  <div class="grid">
+    <div class="card"><small>Pending</small><div id="s-pending"><b>0</b></div></div>
+    <div class="card"><small>Delivered</small><div id="s-delivered"><b>0</b></div></div>
+    <div class="card"><small>Dead Letter Queue</small><div id="s-dlq"><b>0</b></div></div>
+    <div class="card"><small>Avg Latency</small><div id="s-lat"><b>0 ms</b></div></div>
+  </div>
+
+  <div class="card">
+    <strong>Register Webhook Endpoint (SSRF-Protected)</strong>
+    <div class="row" style="margin-top:8px;">
+      <input id="ep-url" placeholder="https://example.com/webhooks" style="flex:1;" />
+      <input id="ep-pats" value="*" placeholder="Event patterns (comma-sep)" />
+      <button onclick="addEndpoint()">Register</button>
+    </div>
+    <table style="margin-top:10px;"><thead><tr><th>URL</th><th>Patterns</th><th>Health</th><th>Secret</th><th>Actions</th></tr></thead><tbody id="ep-body"></tbody></table>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <input id="ev-type" placeholder="order.created" />
+      <input id="ev-json" value='{"orderId":"ord-1"}' style="flex:1;" />
+      <button onclick="publishEvent()">Dispatch Event</button>
+      <button class="ghost" onclick="replayDLQ()">Replay All DLQ</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <strong>Delivery History &amp; DLQ</strong>
+    <table style="margin-top:8px;"><thead><tr><th>Event</th><th>Endpoint</th><th>Status</th><th>Attempts</th><th>Last HTTP / Error</th><th>Actions</th></tr></thead><tbody id="del-body"></tbody></table>
+  </div>
+
+  <script>
+    function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
+    async function api(url, opts = {}) {
+      const headers = { ...(opts.headers || {}) };
+      const k = document.getElementById('api-key').value.trim();
+      if (k && !headers['X-Admin-Token']) headers.Authorization = 'Bearer ' + k;
+      const r = await fetch(url, { ...opts, headers });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.detail || 'Error');
+      return d;
+    }
+    async function createTenant() {
+      const tok = document.getElementById('admin-tok').value.trim();
+      const name = document.getElementById('tenant-name').value.trim();
+      const res = await api('/api/tenants', { method:'POST', headers:{'Content-Type':'application/json','X-Admin-Token':tok}, body: JSON.stringify({ name }) });
+      document.getElementById('api-key').value = res.api_key;
+      document.getElementById('status-msg').textContent = `Tenant created. API key copied into field (${res.api_key.slice(0,14)}...).`;
+      await refresh();
+    }
+    async function addEndpoint() {
+      const patterns = document.getElementById('ep-pats').value.split(',').map(x=>x.trim()).filter(Boolean);
+      const ep = await api('/api/endpoints', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ url: document.getElementById('ep-url').value.trim(), event_patterns: patterns }) });
+      document.getElementById('status-msg').textContent = `Endpoint created. Signing secret: ${ep.primary_secret}`;
+      await refresh();
+    }
+    async function rotateEp(id) {
+      const ep = await api(`/api/endpoints/${id}/rotate-secret`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ grace_seconds: 3600 }) });
+      document.getElementById('status-msg').textContent = `Rotated secret: ${ep.primary_secret} (previous valid 1h)`;
+      await refresh();
+    }
+    async function publishEvent() {
+      const payload = JSON.parse(document.getElementById('ev-json').value);
+      const res = await api('/api/events', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ event_type: document.getElementById('ev-type').value.trim(), payload }) });
+      document.getElementById('status-msg').textContent = `Event ${res.event.id} queued (${res.queued_deliveries} deliveries).`;
+      setTimeout(refresh, 400);
+    }
+    async function replayOne(id) { await api(`/api/deliveries/${id}/replay`, { method:'POST' }); setTimeout(refresh, 400); }
+    async function replayDLQ() { const r = await api('/api/dlq/replay', { method:'POST' }); document.getElementById('status-msg').textContent = `Requeued ${r.requeued} DLQ deliveries.`; setTimeout(refresh, 400); }
+    async function refresh() {
+      try {
+        const st = await api('/api/stats');
+        document.getElementById('s-pending').innerHTML = `<b>${st.pending}</b>`;
+        document.getElementById('s-delivered').innerHTML = `<b>${st.delivered}</b>`;
+        document.getElementById('s-dlq').innerHTML = `<b>${st.dlq}</b>`;
+        document.getElementById('s-lat').innerHTML = `<b>${st.avg_latency_ms} ms</b>`;
+        const eps = await api('/api/endpoints');
+        document.getElementById('ep-body').innerHTML = eps.endpoints.map(e => `<tr>
+          <td><code>${esc(e.url)}</code></td><td>${esc(e.event_patterns.join(', '))}</td>
+          <td><span class="pill st-${esc(e.health_status)}">${esc(e.health_status)}</span></td>
+          <td><code>${esc(e.secret_preview)}</code></td>
+          <td><button class="ghost sm" onclick="rotateEp('${esc(e.id)}')">Rotate Secret</button></td>
+        </tr>`).join('');
+        const dels = await api('/api/deliveries');
+        document.getElementById('del-body').innerHTML = dels.deliveries.map(d => `<tr>
+          <td>${esc(d.event_type)}</td><td><code>${esc(d.url)}</code></td>
+          <td><span class="pill st-${esc(d.status)}">${esc(d.status)}</span></td>
+          <td>${d.attempt_count}/${d.max_attempts}</td>
+          <td>${esc(d.last_status_code || '-')} ${esc(d.last_error || '')}</td>
+          <td><button class="ghost sm" onclick="replayOne('${esc(d.id)}')">Replay</button></td>
+        </tr>`).join('');
+      } catch (e) { document.getElementById('status-msg').textContent = e.message; }
+    }
+  </script>
+</body>
+</html>
